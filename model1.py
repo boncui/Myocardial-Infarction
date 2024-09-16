@@ -11,6 +11,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import SelectKBest, f_classif
 from imblearn.over_sampling import SMOTE
+from imblearn.combine import SMOTEENN
 import matplotlib.pyplot as plt
 
 # Load the data
@@ -50,7 +51,6 @@ def preprocess_data(data):
     
     # Feature engineering (example: create age groups)
     X['AGE_GROUP'] = pd.cut(X['AGE'], bins=[0, 40, 60, 80, 100], labels=[0, 1, 2, 3])
-    # Add -1 to the categories and then fill NaN values
     X['AGE_GROUP'] = X['AGE_GROUP'].cat.add_categories([-1]).fillna(-1).astype(int)
     
     # Convert target values to binary (0 and 1)
@@ -63,60 +63,17 @@ def preprocess_data(data):
 
 # Feature selection
 def select_features(X, y, k=50):
-    # Only select numeric columns for mean imputation
     numeric_X = X.select_dtypes(include=[np.number])
-    
-    # Apply SelectKBest
     selector = SelectKBest(f_classif, k=k)
-    X_new = selector.fit_transform(numeric_X, y.iloc[:, 0])  # Using the first target for feature selection
+    X_new = selector.fit_transform(numeric_X, y.iloc[:, 0])
     selected_features = numeric_X.columns[selector.get_support()]
-    
     return X[selected_features]
 
-# Apply SMOTE to each label column individually
-def apply_smote(X_train, y_train):
-    smote = SMOTE(random_state=42)
-    
-    # Combine all target columns into a single column by concatenating them (for SMOTE)
-    y_combined = y_train.apply(lambda row: ''.join(row.astype(str)), axis=1)
-    
-    # Get unique classes and their counts
-    unique_classes, counts = np.unique(y_combined, return_counts=True)
-    
-    # Adjust n_neighbors dynamically based on class counts, handle cases with very few samples
-    min_class_count = min(counts)
-    if min_class_count <= 5:
-        # Skip SMOTE for labels with fewer than 2 samples
-        print(f"Skipping SMOTE for classes with very few samples: {min_class_count} samples")
-        smote = SMOTE(random_state=42, k_neighbors=1)  # Use k_neighbors=1 for small classes
-    
-    # Apply SMOTE to the combined labels
-    try:
-        X_resampled, y_resampled_combined = smote.fit_resample(X_train, y_combined)
-    except ValueError as e:
-        print(f"Error in SMOTE resampling: {e}")
-        return X_train, y_train  # Return the original dataset if SMOTE fails
-    
-    # Split the combined labels back into individual columns
-    y_resampled_list = pd.DataFrame([list(map(int, label)) for label in y_resampled_combined], columns=y_train.columns)
-    
-    return X_resampled, y_resampled_list
-
-
-# Load and preprocess the data
-data = load_data("/Users/boncui/Desktop/Projects/Personal Projects/Mydocardial infarction/MI.data")
-X, y = preprocess_data(data)
-
-# Apply feature selection after preprocessing
-X = select_features(X, y)
-
-# Split the data
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Scale features
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
+# Apply SMOTEENN for resampling
+def apply_smoteenn(X_train, y_train):
+    smote_enn = SMOTEENN(random_state=42)
+    X_resampled, y_resampled = smote_enn.fit_resample(X_train, y_train)
+    return X_resampled, pd.DataFrame(y_resampled, columns=y_train.columns)
 
 # Build the model with residual connections
 def build_model(input_shape, output_shape):
@@ -125,7 +82,6 @@ def build_model(input_shape, output_shape):
     x = BatchNormalization()(x)
     x = Dropout(0.3)(x)
     
-    # Residual block
     residual = x
     x = Dense(256, activation='relu')(x)
     x = BatchNormalization()(x)
@@ -136,15 +92,12 @@ def build_model(input_shape, output_shape):
     x = BatchNormalization()(x)
     x = Dropout(0.3)(x)
     
-    outputs = []
-    for i in range(output_shape):
-        output = Dense(1, activation='sigmoid', name=f'output_{i}')(x)
-        outputs.append(output)
+    outputs = [Dense(1, activation='sigmoid', name=f'output_{i}')(x) for i in range(output_shape)]
     
     model = Model(inputs=inputs, outputs=outputs)
     return model
 
-# Custom loss function with class weights
+# Custom weighted loss function
 def weighted_binary_crossentropy(y_true, y_pred):
     epsilon = 1e-7
     y_pred = tf.clip_by_value(y_pred, epsilon, 1 - epsilon)
@@ -155,29 +108,37 @@ def weighted_binary_crossentropy(y_true, y_pred):
     weighted_bce = bce * weights
     return tf.reduce_mean(weighted_bce)
 
-# K-fold cross-validation
-n_splits = 5
-kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+# Load and preprocess the data
+data = load_data("/Users/boncui/Desktop/Projects/Personal Projects/Mydocardial infarction/MI.data")
+X, y = preprocess_data(data)
+X = select_features(X, y)
 
-for fold, (train_index, val_index) in enumerate(kf.split(X), 1):
+# Split the data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# K-fold cross-validation with Stratified KFold
+n_splits = 5
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+for fold, (train_index, val_index) in enumerate(skf.split(X, y['fibr_ter_01']), 1):
     print(f"Fold {fold}")
     
-    X_train, X_val = X.iloc[train_index], X.iloc[val_index]
-    y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+    X_train_fold, X_val_fold = X.iloc[train_index], X.iloc[val_index]
+    y_train_fold, y_val_fold = y.iloc[train_index], y.iloc[val_index]
     
-    # Apply SMOTE to training data
-    X_train_resampled, y_train_resampled = apply_smote(X_train, y_train)
+    # Apply SMOTEENN
+    X_train_resampled, y_train_resampled = apply_smoteenn(X_train_fold, y_train_fold)
     
     # Scale features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train_resampled)
-    X_val_scaled = scaler.transform(X_val)
+    X_val_scaled = scaler.transform(X_val_fold)
     
     # Build and compile the model
     model = build_model(X_train_scaled.shape[1], y_train_resampled.shape[1])
     model.compile(optimizer=Adam(learning_rate=0.001),
-              loss=[weighted_binary_crossentropy] * y_train_resampled.shape[1],
-              metrics=['accuracy'] * y_train_resampled.shape[1])
+                  loss=[weighted_binary_crossentropy] * y_train_resampled.shape[1],
+                  metrics=['accuracy'] * y_train_resampled.shape[1])
     
     # Callbacks
     early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
@@ -188,17 +149,16 @@ for fold, (train_index, val_index) in enumerate(kf.split(X), 1):
                         [y_train_resampled.iloc[:, i] for i in range(y_train_resampled.shape[1])], 
                         epochs=100, 
                         batch_size=32, 
-                        validation_data=(X_val_scaled, [y_val.iloc[:, i] for i in range(y_val.shape[1])]),
+                        validation_data=(X_val_scaled, [y_val_fold.iloc[:, i] for i in range(y_val_fold.shape[1])]),
                         callbacks=[early_stopping, reduce_lr])
     
     # Evaluate the model
     y_pred = model.predict(X_val_scaled)
     y_pred_classes = (np.array(y_pred) > 0.5).astype(int)
     
-    # Print classification report for each label
     for i, col in enumerate(y.columns):
         print(f"\nClassification Report for {col}:")
-        print(classification_report(y_val.iloc[:, i], y_pred_classes[i]))
+        print(classification_report(y_val_fold.iloc[:, i], y_pred_classes[i]))
     
     # Plot training history
     plt.figure(figsize=(12, 4))
