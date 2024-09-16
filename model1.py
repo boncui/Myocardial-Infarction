@@ -10,8 +10,8 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import SelectKBest, f_classif
-from imblearn.over_sampling import SMOTE
-from imblearn.combine import SMOTEENN
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.over_sampling import BorderlineSMOTE, ADASYN
 import matplotlib.pyplot as plt
 
 # Load the data
@@ -35,6 +35,7 @@ def load_data(file_path):
     data = pd.read_csv(file_path, sep=',', header=None, names=column_names, na_values='?')
     return data
 
+# Preprocess the data
 # Preprocess the data
 def preprocess_data(data):
     # Separate features and target
@@ -69,11 +70,53 @@ def select_features(X, y, k=50):
     selected_features = numeric_X.columns[selector.get_support()]
     return X[selected_features]
 
-# Apply SMOTEENN for resampling
-def apply_smoteenn(X_train, y_train):
-    smote_enn = SMOTEENN(random_state=42)
-    X_resampled, y_resampled = smote_enn.fit_resample(X_train, y_train)
-    return X_resampled, pd.DataFrame(y_resampled, columns=y_train.columns)
+# Apply per-class resampling strategy
+def apply_classwise_resampling(X_train, y_train):
+    X_resampled = X_train.copy()
+    y_resampled_list = []
+
+    for i in range(y_train.shape[1]):
+        target_col = y_train.iloc[:, i]
+        pos_count = target_col.sum()
+        
+        if pos_count < 10:  # Very few samples
+            print(f"Undersampling applied to target column {i}")
+            undersampler = RandomUnderSampler(sampling_strategy='majority', random_state=42)
+            X_resampled_col, target_col_resampled = undersampler.fit_resample(X_resampled, target_col)
+        elif pos_count < 50:  # Moderately imbalanced
+            print(f"ADASYN applied to target column {i}")
+            adasyn = ADASYN(sampling_strategy='minority', random_state=42, n_neighbors=min(5, pos_count - 1))
+            try:
+                X_resampled_col, target_col_resampled = adasyn.fit_resample(X_resampled, target_col)
+            except ValueError as e:
+                print(f"ADASYN failed for target column {i}: {e}")
+                X_resampled_col, target_col_resampled = X_resampled, target_col
+        else:
+            print(f"No resampling applied to target column {i}")
+            X_resampled_col, target_col_resampled = X_resampled, target_col
+
+        # Trim X_resampled_col to match target_col_resampled if necessary
+        if len(X_resampled_col) != len(target_col_resampled):
+            print(f"Trimming X_resampled_col to match y_resampled_col for target column {i}")
+            X_resampled_col = X_resampled_col.iloc[:len(target_col_resampled)]
+        
+        target_col_resampled = pd.Series(target_col_resampled).reset_index(drop=True)
+        y_resampled_list.append(target_col_resampled)
+
+        # Ensure X_resampled has the correct size for the next iteration
+        X_resampled = X_resampled_col
+
+    y_resampled = pd.concat(y_resampled_list, axis=1)
+    y_resampled.columns = y_train.columns
+
+    # Final check: Ensure all columns in y_resampled have the same size as X_resampled
+    if len(X_resampled) != len(y_resampled):
+        print(f"Final trim to ensure consistent size between X_resampled and y_resampled")
+        X_resampled = X_resampled.iloc[:min(len(X_resampled), len(y_resampled))]
+        y_resampled = y_resampled.iloc[:min(len(X_resampled), len(y_resampled))]
+
+    return X_resampled, y_resampled
+
 
 # Build the model with residual connections
 def build_model(input_shape, output_shape):
@@ -118,16 +161,16 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_
 
 # K-fold cross-validation with Stratified KFold
 n_splits = 5
-skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-for fold, (train_index, val_index) in enumerate(skf.split(X, y['fibr_ter_01']), 1):
+for fold, (train_index, val_index) in enumerate(kf.split(X), 1):
     print(f"Fold {fold}")
     
     X_train_fold, X_val_fold = X.iloc[train_index], X.iloc[val_index]
     y_train_fold, y_val_fold = y.iloc[train_index], y.iloc[val_index]
     
-    # Apply SMOTEENN
-    X_train_resampled, y_train_resampled = apply_smoteenn(X_train_fold, y_train_fold)
+    # Apply classwise resampling
+    X_train_resampled, y_train_resampled = apply_classwise_resampling(X_train_fold, y_train_fold)
     
     # Scale features
     scaler = StandardScaler()
